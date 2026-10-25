@@ -1,0 +1,93 @@
+# Annuncia su Discord ogni nuova versione della risorsa.
+# Parte a ogni push su main, ma pubblica solo se la "version" in fxmanifest.lua e cambiata.
+# Dalla scheda Actions si puo anche lanciare a mano (Run workflow) per ripubblicare l'ultimo commit.
+#
+# Impostazioni della repo (Settings > Secrets and variables > Actions):
+#   Secret   DISCORD_WEBHOOK  -> URL del webhook del canale annunci
+#   Variable DISCORD_ROLE_ID  -> ID del ruolo da taggare (facoltativo)
+
+name: Discord update
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pubblica aggiornamento su Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          ROLE_ID: ${{ vars.DISCORD_ROLE_ID }}
+          BEFORE: ${{ github.event.before }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$WEBHOOK" ]; then echo "Secret DISCORD_WEBHOOK non impostato, niente da fare."; exit 0; fi
+
+          version_of() {
+            git show "$1:fxmanifest.lua" 2>/dev/null \
+              | sed -nE "s/^[[:space:]]*version[[:space:]]*[\"']([^\"']+)[\"'].*/\1/p" | head -n1
+          }
+          NEW=$(version_of HEAD)
+
+          BASE=""
+          if [ "$EVENT" = "push" ]; then
+            if ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then echo "Primo push del branch, nessun annuncio."; exit 0; fi
+            OLD=$(version_of "$BEFORE")
+            if [ "$NEW" = "$OLD" ]; then echo "Versione invariata ($NEW), nessun annuncio."; exit 0; fi
+            BASE="$BEFORE"
+          elif git cat-file -e "HEAD~1^{commit}" 2>/dev/null; then
+            BASE="HEAD~1"
+          fi
+
+          if [ -n "$BASE" ]; then
+            MESSAGES=$(git log --no-merges --reverse --format=%B "$BASE..HEAD")
+            FILES=$(git diff --name-only "$BASE" HEAD)
+          else
+            MESSAGES=$(git log -1 --format=%B HEAD)
+            FILES=$(git show --name-only --format= HEAD)
+          fi
+
+          # Ogni riga dei messaggi di commit diventa un punto dell'elenco.
+          CHANGES=$(printf '%s\n' "$MESSAGES" \
+            | grep -v -i '^co-authored-by:' \
+            | sed -E 's/^[[:space:]]*[-*•][[:space:]]*//; s/[[:space:]]+$//' \
+            | grep -v '^$' | sed 's/^/• /' || true)
+
+          # File raggruppati per cartella: "• client: main.lua / menu.lua"
+          FILE_LIST=$(printf '%s\n' "$FILES" | grep -v '^\.github/' | grep -v '^$' | awk -v root="$REPO" '
+            { n = split($0, p, "/"); f = p[n]; d = (n > 1) ? substr($0, 1, length($0) - length(f) - 1) : root
+              if (!(d in a)) order[++k] = d
+              a[d] = (d in a) ? a[d] " / " f : f }
+            END { for (i = 1; i <= k; i++) print "• " order[i] ": " a[order[i]] }' || true)
+
+          PAYLOAD=$(jq -n \
+            --arg title "✨ Update: $REPO v$NEW" \
+            --arg changes "${CHANGES:-• General update}" \
+            --arg files "${FILE_LIST:-—}" \
+            --arg role "$ROLE_ID" \
+            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+            def cut($n): if length > $n then .[:($n - 2)] + "\n…" else . end;
+            {
+              content: (if $role != "" then "<@&\($role)>" else "" end),
+              allowed_mentions: { roles: (if $role != "" then [$role] else [] end) },
+              embeds: [{
+                title: $title,
+                color: 15022389,
+                description: ("**Update Content**\n" + ($changes | cut(3900))),
+                fields: [{ name: "Changed Files", value: ($files | cut(1024)) }],
+                footer: { text: "Poker Studio" },
+                timestamp: $ts
+              }]
+            }')
+
+          curl -fsS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
+          echo "Annuncio pubblicato: $REPO v$NEW"
